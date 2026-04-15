@@ -177,6 +177,16 @@ def select_level0_borders(logits: torch.Tensor, targets: torch.Tensor) -> torch.
     return predictions.ne(targets)
 
 
+def select_level0_entropy_borders(
+    logits: torch.Tensor, threshold: float
+) -> torch.Tensor:
+    """Promote byte positions whose predictive entropy is high."""
+
+    probabilities = logits.softmax(dim=-1)
+    entropy = -(probabilities * probabilities.clamp_min(1e-8).log()).sum(dim=-1)
+    return entropy.gt(threshold)
+
+
 def select_meta_borders(
     predictions: torch.Tensor,
     targets: torch.Tensor,
@@ -187,4 +197,15 @@ def select_meta_borders(
 
     mse = (predictions - targets).pow(2).mean(dim=-1)
     border_mask = mse.gt(threshold)
+    return border_mask & valid_mask
+
+
+def select_meta_uncertainty_borders(
+    predicted_uncertainty: torch.Tensor,
+    valid_mask: torch.Tensor,
+    threshold: float,
+) -> torch.Tensor:
+    """Promote compressed positions whose predicted uncertainty is high."""
+
+    border_mask = predicted_uncertainty.squeeze(-1).gt(threshold)
     return border_mask & valid_mask

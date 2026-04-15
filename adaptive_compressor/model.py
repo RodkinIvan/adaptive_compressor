@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -17,7 +18,9 @@ from .routing import (
     make_byte_targets,
     make_meta_targets,
     select_level0_borders,
+    select_level0_entropy_borders,
     select_meta_borders,
+    select_meta_uncertainty_borders,
 )
 
 
@@ -28,16 +31,22 @@ class AdaptiveCompressorConfig:
     hidden_size: int = 128
     num_levels: int = 3
     threshold: float = 0.1
+    border_mode: str = "uncertainty"
+    byte_entropy_threshold: float = 5.0
+    meta_uncertainty_threshold: float = 0.1
     dropout: float = 0.0
     encoder_loss_weight: float = 1.0
     decoder_loss_weight: float = 1.0
     meta_loss_weight: float = 1.0
+    uncertainty_loss_weight: float = 0.1
     level_thresholds: list[float] = field(default_factory=list)
 
     def thresholds(self) -> list[float]:
         if self.level_thresholds:
             return self.level_thresholds
-        return [self.threshold for _ in range(max(self.num_levels - 1, 0))]
+        return [
+            self.meta_uncertainty_threshold for _ in range(max(self.num_levels - 1, 0))
+        ]
 
 
 class GRUBlock(nn.Module):
@@ -138,6 +147,7 @@ class SimpleByteGRUBaseline(nn.Module):
             "byte_encoder_loss": byte_loss,
             "byte_decoder_loss": byte_loss,
             "meta_loss": byte_loss.new_zeros(()),
+            "uncertainty_loss": byte_loss.new_zeros(()),
             "byte_encoder_logits": byte_logits,
             "byte_decoder_logits": byte_logits,
             "border_counts": [],
@@ -153,6 +163,14 @@ class AdaptiveCompressor(nn.Module):
         super().__init__()
         if config.num_levels < 1:
             raise ValueError("num_levels must be at least 1")
+        if config.border_mode not in {"uncertainty", "teacher_forced"}:
+            raise ValueError("border_mode must be 'uncertainty' or 'teacher_forced'")
+        if config.border_mode == "teacher_forced":
+            warnings.warn(
+                "border_mode='teacher_forced' uses target-dependent routing and leaks future information. "
+                "Keep it for prefill-style experiments only.",
+                stacklevel=2,
+            )
 
         self.config = config
         self.byte_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -167,6 +185,9 @@ class AdaptiveCompressor(nn.Module):
                 nn.Linear(config.hidden_size, config.hidden_size)
                 for _ in range(config.num_levels - 1)
             ]
+        )
+        self.meta_uncertainty_heads = nn.ModuleList(
+            [nn.Linear(config.hidden_size, 1) for _ in range(config.num_levels - 1)]
         )
         self.decoder_blocks = nn.ModuleList(
             [
@@ -195,6 +216,7 @@ class AdaptiveCompressor(nn.Module):
         routings: list[RoutingInfo] = []
         border_counts: list[int] = []
         meta_losses: list[torch.Tensor] = []
+        uncertainty_losses: list[torch.Tensor] = []
 
         level0_inputs = self.byte_embedding(byte_ids)
         level_inputs.append(level0_inputs)
@@ -217,7 +239,13 @@ class AdaptiveCompressor(nn.Module):
         )
 
         if self.config.num_levels > 1:
-            border_mask = select_level0_borders(byte_encoder_logits, byte_targets)
+            if self.config.border_mode == "teacher_forced":
+                border_mask = select_level0_borders(byte_encoder_logits, byte_targets)
+            else:
+                border_mask = select_level0_entropy_borders(
+                    byte_encoder_logits,
+                    threshold=self.config.byte_entropy_threshold,
+                )
             routing = build_routing(border_mask)
             routings.append(routing)
             compressed_inputs = gather_parent_tokens(level0_hidden, routing)
@@ -236,6 +264,9 @@ class AdaptiveCompressor(nn.Module):
             level_hidden_states.append(hidden_states)
 
             meta_predictions = self.meta_predictors[level_idx - 1](hidden_states)
+            predicted_uncertainty = self.meta_uncertainty_heads[level_idx - 1](
+                hidden_states
+            )
             meta_targets, valid_mask = make_meta_targets(
                 compressed_inputs,
                 lengths=current_lengths,
@@ -244,14 +275,26 @@ class AdaptiveCompressor(nn.Module):
             mse_per_position = (meta_predictions - meta_targets).pow(2).mean(dim=-1)
             meta_loss = mse_per_position[valid_mask].mean()
             meta_losses.append(meta_loss)
+            uncertainty_loss = F.mse_loss(
+                predicted_uncertainty.squeeze(-1)[valid_mask],
+                mse_per_position.detach()[valid_mask],
+            )
+            uncertainty_losses.append(uncertainty_loss)
 
             if level_idx < self.config.num_levels - 1:
-                border_mask = select_meta_borders(
-                    meta_predictions,
-                    meta_targets,
-                    valid_mask,
-                    threshold=thresholds[level_idx - 1],
-                )
+                if self.config.border_mode == "teacher_forced":
+                    border_mask = select_meta_borders(
+                        meta_predictions,
+                        meta_targets,
+                        valid_mask,
+                        threshold=self.config.threshold,
+                    )
+                else:
+                    border_mask = select_meta_uncertainty_borders(
+                        predicted_uncertainty,
+                        valid_mask,
+                        threshold=thresholds[level_idx - 1],
+                    )
                 routing = build_routing(border_mask, lengths=current_lengths)
                 routings.append(routing)
                 compressed_inputs = gather_parent_tokens(hidden_states, routing)
@@ -280,10 +323,16 @@ class AdaptiveCompressor(nn.Module):
             if meta_losses
             else byte_decoder_loss.new_zeros(())
         )
+        total_uncertainty_loss = (
+            torch.stack(uncertainty_losses).mean()
+            if uncertainty_losses
+            else byte_decoder_loss.new_zeros(())
+        )
         total_loss = (
             self.config.encoder_loss_weight * byte_encoder_loss
             + self.config.decoder_loss_weight * byte_decoder_loss
             + self.config.meta_loss_weight * total_meta_loss
+            + self.config.uncertainty_loss_weight * total_uncertainty_loss
         )
 
         return {
@@ -291,6 +340,7 @@ class AdaptiveCompressor(nn.Module):
             "byte_encoder_loss": byte_encoder_loss,
             "byte_decoder_loss": byte_decoder_loss,
             "meta_loss": total_meta_loss,
+            "uncertainty_loss": total_uncertainty_loss,
             "byte_encoder_logits": byte_encoder_logits,
             "byte_decoder_logits": byte_decoder_logits,
             "border_counts": border_counts,
