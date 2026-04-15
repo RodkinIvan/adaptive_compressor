@@ -93,7 +93,10 @@ class DecoderBlock(nn.Module):
             parent_broadcast = parent_states
         else:
             parent_broadcast = broadcast_parent_to_child(
-                parent_states, routing, child_inputs.size(1)
+                parent_states,
+                routing,
+                child_inputs.size(1),
+                child_lengths=child_lengths,
             )
         conditioned = child_inputs + self.parent_projection(parent_broadcast)
         return self.gru(conditioned, lengths=child_lengths)

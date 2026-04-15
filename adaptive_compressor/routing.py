@@ -130,19 +130,42 @@ def make_meta_targets(
 
 
 def broadcast_parent_to_child(
-    parent_states: torch.Tensor, routing: RoutingInfo, child_length: int
+    parent_states: torch.Tensor,
+    routing: RoutingInfo,
+    child_length: int,
+    child_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Broadcast each parent state across the child span it owns."""
+    """Broadcast each parent state only to later child positions.
+
+    Parent state at border position ``p`` conditions child positions strictly after ``p``
+    until the next parent border. The first span receives no parent conditioning.
+    """
 
     batch_size, _, hidden_dim = parent_states.shape
     broadcast = parent_states.new_zeros((batch_size, child_length, hidden_dim))
 
     for batch_idx in range(batch_size):
         parent_len = int(routing.parent_lengths[batch_idx].item())
-        if parent_len == 0:
+        if parent_len <= 1:
             continue
-        child_parent_ids = routing.child_to_parent[batch_idx, :child_length]
-        broadcast[batch_idx] = parent_states[batch_idx, child_parent_ids]
+
+        length = child_length
+        if child_lengths is not None:
+            length = int(child_lengths[batch_idx].item())
+
+        parent_positions = routing.parent_positions[batch_idx, :parent_len]
+        for parent_idx in range(1, parent_len):
+            start = int(parent_positions[parent_idx].item()) + 1
+            if start >= length:
+                continue
+
+            if parent_idx + 1 < parent_len:
+                end = min(int(parent_positions[parent_idx + 1].item()), length)
+            else:
+                end = length
+
+            if start < end:
+                broadcast[batch_idx, start:end] = parent_states[batch_idx, parent_idx]
 
     return broadcast
 
