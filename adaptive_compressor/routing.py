@@ -187,6 +187,48 @@ def select_level0_entropy_borders(
     return entropy.gt(threshold)
 
 
+def ensure_nontrivial_borders(
+    border_mask: torch.Tensor,
+    scores: torch.Tensor,
+    lengths: torch.Tensor | None = None,
+    min_border_fraction: float = 0.0,
+) -> torch.Tensor:
+    """Ensure each non-empty sequence keeps enough borders after position 0.
+
+    Thresholds alone can collapse routing to only the forced start border. When that
+    happens, or when too few later borders survive, promote the highest-scoring later
+    positions as a fallback.
+    """
+
+    batch_size, seq_len = border_mask.shape
+    fixed_mask = border_mask.clone()
+
+    if lengths is None:
+        lengths = torch.full(
+            (batch_size,), seq_len, device=border_mask.device, dtype=torch.long
+        )
+
+    for batch_idx in range(batch_size):
+        length = int(lengths[batch_idx].item())
+        if length <= 1:
+            continue
+
+        min_extra_borders = max(1, int((length - 1) * min_border_fraction))
+        current_extra_borders = int(fixed_mask[batch_idx, 1:length].sum().item())
+        if current_extra_borders >= min_extra_borders:
+            continue
+
+        needed = min_extra_borders - current_extra_borders
+        available_scores = scores[batch_idx, 1:length].clone()
+        available_scores[fixed_mask[batch_idx, 1:length]] = float("-inf")
+        top_indices = (
+            torch.topk(available_scores, k=min(needed, length - 1)).indices + 1
+        )
+        fixed_mask[batch_idx, top_indices] = True
+
+    return fixed_mask
+
+
 def select_meta_borders(
     predictions: torch.Tensor,
     targets: torch.Tensor,

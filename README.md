@@ -14,6 +14,7 @@ By default, border selection is causal:
 2. Higher levels promote positions whose predicted next-embedding uncertainty is above `--meta-uncertainty-threshold`.
 3. The original teacher-forced border rule is still available with `--border-mode teacher_forced`, but it leaks target information and should not be used for fair LM evaluation.
 4. `--threshold` is kept for the legacy teacher-forced meta-border MSE threshold.
+5. In uncertainty mode, these thresholds are applied to per-sequence normalized scores, not raw entropy/MSE values.
 
 ## Baseline
 
@@ -39,8 +40,8 @@ python -m adaptive_compressor.train \
   --hidden-size 128 \
   --num-levels 3 \
   --threshold 0.1 \
-  --byte-entropy-threshold 5.0 \
-  --meta-uncertainty-threshold 0.1 \
+  --byte-entropy-threshold 0.0 \
+  --meta-uncertainty-threshold 0.0 \
   --eval-every 20 \
   --max-steps 200
 ```
@@ -62,6 +63,7 @@ The script uses `Salesforce/wikitext` with config `wikitext-103-raw-v1` by defau
 Pass `--disable-wandb` to run without online logging.
 If `--wandb-run-name` is not provided, the default run name is `${model_type}_L${sequence_length}_B${batch_tokens // 1000}k`.
 If you pass `--border-mode teacher_forced`, training will warn that the adaptive routing uses target-dependent borders and therefore leaks future information.
+For comparison to the simple baseline, prefer `byte_encoder_bpb` rather than `byte_decoder_bpb`, because the adaptive decoder adds extra depth even when the hierarchy collapses.
 
 ## Inference
 

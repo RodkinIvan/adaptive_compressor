@@ -14,11 +14,11 @@ from .routing import (
     RoutingInfo,
     broadcast_parent_to_child,
     build_routing,
+    ensure_nontrivial_borders,
     gather_parent_tokens,
     make_byte_targets,
     make_meta_targets,
     select_level0_borders,
-    select_level0_entropy_borders,
     select_meta_borders,
     select_meta_uncertainty_borders,
 )
@@ -32,8 +32,9 @@ class AdaptiveCompressorConfig:
     num_levels: int = 3
     threshold: float = 0.1
     border_mode: str = "uncertainty"
-    byte_entropy_threshold: float = 5.0
-    meta_uncertainty_threshold: float = 0.1
+    byte_entropy_threshold: float = 0.0
+    meta_uncertainty_threshold: float = 0.0
+    min_border_fraction: float = 0.25
     dropout: float = 0.0
     encoder_loss_weight: float = 1.0
     decoder_loss_weight: float = 1.0
@@ -81,6 +82,32 @@ class GRUBlock(nn.Module):
             packed_outputs, batch_first=True, total_length=inputs.size(1)
         )
         return outputs
+
+
+def normalize_sequence_scores(
+    scores: torch.Tensor,
+    lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Normalize scores per sequence to make thresholding scale-robust."""
+
+    batch_size, seq_len = scores.shape
+    normalized = scores.new_zeros(scores.shape)
+
+    if lengths is None:
+        lengths = torch.full(
+            (batch_size,), seq_len, device=scores.device, dtype=torch.long
+        )
+
+    for batch_idx in range(batch_size):
+        length = int(lengths[batch_idx].item())
+        if length <= 1:
+            continue
+        valid_scores = scores[batch_idx, 1:length]
+        mean = valid_scores.mean()
+        std = valid_scores.std(unbiased=False).clamp_min(1e-6)
+        normalized[batch_idx, 1:length] = (valid_scores - mean) / std
+
+    return normalized
 
 
 class DecoderBlock(nn.Module):
@@ -242,9 +269,16 @@ class AdaptiveCompressor(nn.Module):
             if self.config.border_mode == "teacher_forced":
                 border_mask = select_level0_borders(byte_encoder_logits, byte_targets)
             else:
-                border_mask = select_level0_entropy_borders(
-                    byte_encoder_logits,
-                    threshold=self.config.byte_entropy_threshold,
+                probabilities = byte_encoder_logits.softmax(dim=-1)
+                entropy_scores = -(
+                    probabilities * probabilities.clamp_min(1e-8).log()
+                ).sum(dim=-1)
+                normalized_entropy = normalize_sequence_scores(entropy_scores)
+                border_mask = normalized_entropy.gt(self.config.byte_entropy_threshold)
+                border_mask = ensure_nontrivial_borders(
+                    border_mask,
+                    normalized_entropy,
+                    min_border_fraction=self.config.min_border_fraction,
                 )
             routing = build_routing(border_mask)
             routings.append(routing)
@@ -264,8 +298,8 @@ class AdaptiveCompressor(nn.Module):
             level_hidden_states.append(hidden_states)
 
             meta_predictions = self.meta_predictors[level_idx - 1](hidden_states)
-            predicted_uncertainty = self.meta_uncertainty_heads[level_idx - 1](
-                hidden_states
+            predicted_uncertainty = F.softplus(
+                self.meta_uncertainty_heads[level_idx - 1](hidden_states)
             )
             meta_targets, valid_mask = make_meta_targets(
                 compressed_inputs,
@@ -290,10 +324,20 @@ class AdaptiveCompressor(nn.Module):
                         threshold=self.config.threshold,
                     )
                 else:
+                    normalized_uncertainty = normalize_sequence_scores(
+                        predicted_uncertainty.squeeze(-1),
+                        lengths=current_lengths,
+                    )
                     border_mask = select_meta_uncertainty_borders(
-                        predicted_uncertainty,
+                        normalized_uncertainty.unsqueeze(-1),
                         valid_mask,
                         threshold=thresholds[level_idx - 1],
+                    )
+                    border_mask = ensure_nontrivial_borders(
+                        border_mask,
+                        normalized_uncertainty,
+                        lengths=current_lengths,
+                        min_border_fraction=self.config.min_border_fraction,
                     )
                 routing = build_routing(border_mask, lengths=current_lengths)
                 routings.append(routing)

@@ -35,8 +35,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--num-levels", type=int, default=3)
     parser.add_argument("--threshold", type=float, default=0.1)
-    parser.add_argument("--byte-entropy-threshold", type=float, default=5.0)
-    parser.add_argument("--meta-uncertainty-threshold", type=float, default=0.1)
+    parser.add_argument("--byte-entropy-threshold", type=float, default=0.0)
+    parser.add_argument("--meta-uncertainty-threshold", type=float, default=0.0)
+    parser.add_argument("--min-border-fraction", type=float, default=0.25)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
@@ -115,6 +116,7 @@ def evaluate(
         return {
             "val/loss": 0.0,
             "val/byte_encoder_loss": 0.0,
+            "val/byte_encoder_bpb": 0.0,
             "val/meta_loss": 0.0,
             "val/uncertainty_loss": 0.0,
             "val/byte_decoder_loss": 0.0,
@@ -125,6 +127,7 @@ def evaluate(
     return {
         "val/loss": total_loss * scale,
         "val/byte_encoder_loss": total_byte_encoder_loss * scale,
+        "val/byte_encoder_bpb": (total_byte_encoder_loss * scale) / math.log(2.0),
         "val/meta_loss": total_meta_loss * scale,
         "val/uncertainty_loss": total_uncertainty_loss * scale,
         "val/byte_decoder_loss": total_byte_decoder_loss * scale,
@@ -197,6 +200,7 @@ def main() -> None:
         border_mode=args.border_mode,
         byte_entropy_threshold=args.byte_entropy_threshold,
         meta_uncertainty_threshold=args.meta_uncertainty_threshold,
+        min_border_fraction=args.min_border_fraction,
         dropout=args.dropout,
     )
     model = build_model(args.model_type, model_config).to(device)
@@ -231,6 +235,8 @@ def main() -> None:
                 metrics = {
                     "train/loss": outputs["loss"].item(),
                     "train/byte_encoder_loss": outputs["byte_encoder_loss"].item(),
+                    "train/byte_encoder_bpb": outputs["byte_encoder_loss"].item()
+                    / math.log(2.0),
                     "train/meta_loss": outputs["meta_loss"].item(),
                     "train/uncertainty_loss": outputs["uncertainty_loss"].item(),
                     "train/byte_decoder_loss": outputs["byte_decoder_loss"].item(),
@@ -246,7 +252,7 @@ def main() -> None:
                 progress.set_postfix(
                     loss=f"{metrics['train/loss']:.4f}",
                     bpb=f"{metrics['train/byte_decoder_bpb']:.3f}",
-                    enc=f"{metrics['train/byte_encoder_loss']:.4f}",
+                    enc=f"{metrics['train/byte_encoder_bpb']:.3f}",
                     meta=f"{metrics['train/meta_loss']:.4f}",
                     unc=f"{metrics['train/uncertainty_loss']:.4f}",
                     dec=f"{metrics['train/byte_decoder_loss']:.4f}",
@@ -256,7 +262,7 @@ def main() -> None:
                     f"step={step} "
                     f"loss={metrics['train/loss']:.4f} "
                     f"bpb={metrics['train/byte_decoder_bpb']:.3f} "
-                    f"enc={metrics['train/byte_encoder_loss']:.4f} "
+                    f"enc_bpb={metrics['train/byte_encoder_bpb']:.3f} "
                     f"meta={metrics['train/meta_loss']:.4f} "
                     f"unc={metrics['train/uncertainty_loss']:.4f} "
                     f"dec={metrics['train/byte_decoder_loss']:.4f} "
@@ -283,7 +289,7 @@ def main() -> None:
                     f"eval step={step} "
                     f"val_loss={val_metrics['val/loss']:.4f} "
                     f"val_bpb={val_metrics['val/byte_decoder_bpb']:.3f} "
-                    f"val_enc={val_metrics['val/byte_encoder_loss']:.4f} "
+                    f"val_enc_bpb={val_metrics['val/byte_encoder_bpb']:.3f} "
                     f"val_meta={val_metrics['val/meta_loss']:.4f} "
                     f"val_unc={val_metrics['val/uncertainty_loss']:.4f} "
                     f"val_dec={val_metrics['val/byte_decoder_loss']:.4f}"
