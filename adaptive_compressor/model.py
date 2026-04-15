@@ -138,24 +138,63 @@ class DecoderBlock(nn.Module):
         return self.gru(conditioned, lengths=child_lengths)
 
 
+def count_parameters(module: nn.Module) -> int:
+    """Return the number of trainable parameters in a module."""
+
+    return sum(parameter.numel() for parameter in module.parameters())
+
+
 class SimpleByteGRUBaseline(nn.Module):
     """Plain byte-level baseline with one stacked GRU and one LM loss."""
 
-    def __init__(self, config: AdaptiveCompressorConfig) -> None:
+    def __init__(
+        self, config: AdaptiveCompressorConfig, target_parameter_count: int
+    ) -> None:
         super().__init__()
         if config.num_levels < 1:
             raise ValueError("num_levels must be at least 1")
 
         self.config = config
         self.byte_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.gru_layers = self._choose_gru_layers(config, target_parameter_count)
         self.gru = nn.GRU(
             input_size=config.hidden_size,
             hidden_size=config.hidden_size,
-            num_layers=2 * config.num_levels,
+            num_layers=self.gru_layers,
             batch_first=True,
             dropout=config.dropout,
         )
         self.byte_head = nn.Linear(config.hidden_size, config.vocab_size)
+        residual_parameters = target_parameter_count - count_parameters(self)
+        if residual_parameters < 0:
+            raise ValueError("Baseline parameter count exceeded adaptive target")
+        self.parameter_match_pad = nn.Parameter(torch.zeros(residual_parameters))
+
+    @staticmethod
+    def _choose_gru_layers(
+        config: AdaptiveCompressorConfig,
+        target_parameter_count: int,
+    ) -> int:
+        """Pick the deepest plain GRU stack that stays within the target count."""
+
+        best_layers = 1
+        for layers in range(1, 8 * config.num_levels + 1):
+            probe = nn.Module()
+            probe.byte_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+            probe.gru = nn.GRU(
+                input_size=config.hidden_size,
+                hidden_size=config.hidden_size,
+                num_layers=layers,
+                batch_first=True,
+                dropout=config.dropout,
+            )
+            probe.byte_head = nn.Linear(config.hidden_size, config.vocab_size)
+            parameter_count = count_parameters(probe)
+            if parameter_count > target_parameter_count:
+                break
+            best_layers = layers
+
+        return best_layers
 
     def forward(
         self, byte_ids: torch.Tensor
@@ -400,5 +439,8 @@ def build_model(
     if model_type == "adaptive":
         return AdaptiveCompressor(config)
     if model_type == "baseline":
-        return SimpleByteGRUBaseline(config)
+        target_parameter_count = count_parameters(AdaptiveCompressor(config))
+        return SimpleByteGRUBaseline(
+            config, target_parameter_count=target_parameter_count
+        )
     raise ValueError(f"Unknown model_type: {model_type}")
