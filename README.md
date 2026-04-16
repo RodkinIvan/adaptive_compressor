@@ -1,6 +1,6 @@
 # Adaptive Compressor
 
-Minimal PyTorch prototype of a hierarchical byte-level language model with adaptive border selection, plus a simple byte-level GRU baseline.
+Minimal PyTorch prototype of a hierarchical byte-level language model with adaptive border selection, plus a residual byte-level GRU baseline.
 
 ## Core idea
 
@@ -18,7 +18,7 @@ By default, border selection is causal:
 
 ## Baseline
 
-Use `--model-type baseline` for a simple byte model: one stacked GRU over bytes with total depth equal to the adaptive stack. It uses only the final next-byte loss.
+Use `--model-type baseline` for a non-hierarchical byte model built from residual 2-layer GRU blocks. It uses only the final next-byte loss, but matches the adaptive model's trainable parameter count exactly.
 
 ## Install
 
@@ -48,6 +48,15 @@ python -m adaptive_compressor.train \
   --max-steps 200
 ```
 
+Or use the helper scripts:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 scripts/run_adaptive.sh --max-steps 200 --batch-size 16
+CUDA_VISIBLE_DEVICES=1 scripts/run_baseline.sh --max-steps 200 --batch-size 16
+```
+
+The scripts accept common hyperparameters through environment variables such as `SEQUENCE_LENGTH`, `BATCH_SIZE`, `HIDDEN_SIZE`, `NUM_LEVELS`, and also forward any extra CLI flags you append.
+
 ```bash
 python -m adaptive_compressor.train \
   --model-type baseline \
@@ -65,7 +74,7 @@ The script uses `Salesforce/wikitext` with config `wikitext-103-raw-v1` by defau
 Pass `--disable-wandb` to run without online logging.
 If `--wandb-run-name` is not provided, the default run name is `${model_type}_L${sequence_length}_B${batch_tokens // 1000}k`.
 If you pass `--border-mode teacher_forced`, training will warn that the adaptive routing uses target-dependent borders and therefore leaks future information.
-For comparison to the simple baseline, prefer `byte_encoder_bpb` rather than `byte_decoder_bpb`, because the adaptive decoder adds extra depth even when the hierarchy collapses.
+For comparison to the residual baseline, prefer `byte_encoder_bpb` rather than `byte_decoder_bpb`, because the adaptive decoder adds extra depth even when the hierarchy collapses.
 
 ## Inference
 
@@ -91,7 +100,7 @@ python -m adaptive_compressor.infer checkpoints/adaptive_compressor.pt \
 
 ## Files
 
-1. `adaptive_compressor/model.py` - hierarchical encoder/decoder model.
+1. `adaptive_compressor/models/` - split model package with shared modules, adaptive model, and baseline.
 2. `adaptive_compressor/routing.py` - border selection and span routing helpers.
 3. `adaptive_compressor/data.py` - WikiText byte dataset.
 4. `adaptive_compressor/train.py` - small training entry point.

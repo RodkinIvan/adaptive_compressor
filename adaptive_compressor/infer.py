@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 import torch
@@ -11,10 +10,10 @@ import torch.nn.functional as F
 
 from .model import (
     AdaptiveCompressor,
-    AdaptiveCompressorConfig,
-    SimpleByteGRUBaseline,
+    ResidualByteBaseline,
     build_model,
 )
+from .runtime import choose_device, load_checkpoint, load_config
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,34 +37,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def choose_device(requested: str) -> torch.device:
-    if requested == "mps":
-        return torch.device("mps")
-    if requested == "cuda":
-        return torch.device("cuda")
-    if requested == "cpu":
-        return torch.device("cpu")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-
 def load_prompt(args: argparse.Namespace) -> bytes:
     if args.prompt_file is not None:
         return args.prompt_file.read_bytes()
     return args.prompt.encode("utf-8")
-
-
-def load_config(config_payload: object) -> AdaptiveCompressorConfig:
-    if isinstance(config_payload, AdaptiveCompressorConfig):
-        return config_payload
-    if is_dataclass(config_payload):
-        return AdaptiveCompressorConfig(**asdict(config_payload))
-    if isinstance(config_payload, dict):
-        return AdaptiveCompressorConfig(**config_payload)
-    raise TypeError(f"Unsupported config payload type: {type(config_payload)!r}")
 
 
 def sample_next_token(logits: torch.Tensor, temperature: float, top_k: int) -> int:
@@ -100,22 +75,27 @@ def step_gru(
 
 
 class CachedBaselineGenerator:
-    """Exact linear-time generator for the plain byte GRU baseline."""
+    """Exact linear-time generator for the residual byte baseline."""
 
-    def __init__(self, model: SimpleByteGRUBaseline, device: torch.device) -> None:
+    def __init__(self, model: ResidualByteBaseline, device: torch.device) -> None:
         self.model = model
         self.device = device
-        self.hidden = torch.zeros(
-            model.gru.num_layers,
-            1,
-            model.config.hidden_size,
-            device=device,
-        )
+        self.hidden_states = [
+            torch.zeros(2, 1, model.config.hidden_size, device=device)
+            for _ in model.blocks
+        ]
 
     def step(self, token_id: int) -> torch.Tensor:
         token = torch.tensor([token_id], device=self.device)
-        embeddings = self.model.byte_embedding(token)[0]
-        hidden_state, self.hidden = step_gru(self.model.gru, self.hidden, embeddings)
+        hidden_state = self.model.byte_embedding(token)[0]
+        for block_idx, block in enumerate(self.model.blocks):
+            block_output, next_hidden = step_gru(
+                block.gru_block.gru,
+                self.hidden_states[block_idx],
+                hidden_state,
+            )
+            self.hidden_states[block_idx] = next_hidden
+            hidden_state = hidden_state + block_output
         return self.model.byte_head(hidden_state)
 
 
@@ -264,7 +244,7 @@ def build_cached_generator(
 ) -> CachedAdaptiveGenerator | CachedBaselineGenerator:
     if isinstance(model, AdaptiveCompressor):
         return CachedAdaptiveGenerator(model, device=device)
-    if isinstance(model, SimpleByteGRUBaseline):
+    if isinstance(model, ResidualByteBaseline):
         return CachedBaselineGenerator(model, device=device)
     raise TypeError(f"Unsupported model type for cached inference: {type(model)!r}")
 
@@ -350,7 +330,7 @@ def check_causality(
 def main() -> None:
     args = parse_args()
     device = choose_device(args.device)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint = load_checkpoint(args.checkpoint)
 
     config = load_config(checkpoint["config"])
     train_args = checkpoint.get("args", {})

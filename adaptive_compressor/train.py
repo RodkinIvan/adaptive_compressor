@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 
 from .data import ByteDatasetConfig, load_wikitext_byte_dataset
 from .model import AdaptiveCompressorConfig, build_model
+from .runtime import choose_device
 
 try:
     import wandb
@@ -56,14 +57,6 @@ def parse_args() -> argparse.Namespace:
         "--output", type=Path, default=Path("checkpoints/adaptive_compressor.pt")
     )
     return parser.parse_args()
-
-
-def choose_device() -> torch.device:
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
 
 
 def format_border_stats(border_counts: list[int]) -> str:

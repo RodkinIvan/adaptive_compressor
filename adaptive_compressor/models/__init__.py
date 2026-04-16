@@ -1,16 +1,17 @@
-"""Compatibility wrapper around the split model package."""
+"""Model package exports."""
 
-from .models import (
-    AdaptiveCompressor,
+from .adaptive import AdaptiveCompressor
+from .baseline import ResidualByteBaseline
+from .factory import build_model
+from .modules import (
     AdaptiveCompressorConfig,
     GRUBlock,
-    ResidualByteBaseline,
     ResidualGRUBlock,
-    SimpleByteGRUBaseline,
-    build_model,
-    count_parameters,
     cumulative_border_mask,
+    count_parameters,
 )
+
+SimpleByteGRUBaseline = ResidualByteBaseline
 
 __all__ = [
     "AdaptiveCompressor",

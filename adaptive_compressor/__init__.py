@@ -1,8 +1,9 @@
 """Minimal adaptive compressor package."""
 
-from .model import (
+from .models import (
     AdaptiveCompressor,
     AdaptiveCompressorConfig,
+    ResidualByteBaseline,
     SimpleByteGRUBaseline,
     build_model,
 )
@@ -10,6 +11,7 @@ from .model import (
 __all__ = [
     "AdaptiveCompressor",
     "AdaptiveCompressorConfig",
+    "ResidualByteBaseline",
     "SimpleByteGRUBaseline",
     "build_model",
 ]
