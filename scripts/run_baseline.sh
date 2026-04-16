@@ -2,7 +2,6 @@
 
 set -euo pipefail
 
-CONDA_ENV="${CONDA_ENV:-ai}"
 SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-128}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-128}"
@@ -24,7 +23,7 @@ if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   CUDA_PREFIX=(env "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}")
 fi
 
-"${CUDA_PREFIX[@]}" conda run -n "${CONDA_ENV}" python -m adaptive_compressor.train \
+"${CUDA_PREFIX[@]}" python -m adaptive_compressor.train \
   --model-type baseline \
   --sequence-length "${SEQUENCE_LENGTH}" \
   --batch-size "${BATCH_SIZE}" \
