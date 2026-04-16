@@ -35,9 +35,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--num-levels", type=int, default=3)
     parser.add_argument("--threshold", type=float, default=0.1)
-    parser.add_argument("--byte-entropy-threshold", type=float, default=0.0)
-    parser.add_argument("--meta-uncertainty-threshold", type=float, default=0.0)
-    parser.add_argument("--min-border-fraction", type=float, default=0.25)
+    parser.add_argument("--byte-entropy-threshold", type=float, default=20.0)
+    parser.add_argument("--meta-uncertainty-threshold", type=float, default=1.0)
+    parser.add_argument("--entropy-floor", type=float, default=0.0)
+    parser.add_argument("--entropy-reg-weight", type=float, default=0.001)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
@@ -92,6 +93,7 @@ def evaluate(
     total_byte_encoder_loss = 0.0
     total_meta_loss = 0.0
     total_uncertainty_loss = 0.0
+    total_entropy_reg_loss = 0.0
     total_byte_decoder_loss = 0.0
     batch_count = 0
 
@@ -104,6 +106,7 @@ def evaluate(
             total_byte_encoder_loss += outputs["byte_encoder_loss"].item()
             total_meta_loss += outputs["meta_loss"].item()
             total_uncertainty_loss += outputs["uncertainty_loss"].item()
+            total_entropy_reg_loss += outputs["entropy_reg_loss"].item()
             total_byte_decoder_loss += outputs["byte_decoder_loss"].item()
             batch_count += 1
 
@@ -119,6 +122,7 @@ def evaluate(
             "val/byte_encoder_bpb": 0.0,
             "val/meta_loss": 0.0,
             "val/uncertainty_loss": 0.0,
+            "val/entropy_reg_loss": 0.0,
             "val/byte_decoder_loss": 0.0,
             "val/byte_decoder_bpb": 0.0,
         }
@@ -130,6 +134,7 @@ def evaluate(
         "val/byte_encoder_bpb": (total_byte_encoder_loss * scale) / math.log(2.0),
         "val/meta_loss": total_meta_loss * scale,
         "val/uncertainty_loss": total_uncertainty_loss * scale,
+        "val/entropy_reg_loss": total_entropy_reg_loss * scale,
         "val/byte_decoder_loss": total_byte_decoder_loss * scale,
         "val/byte_decoder_bpb": (total_byte_decoder_loss * scale) / math.log(2.0),
     }
@@ -200,7 +205,8 @@ def main() -> None:
         border_mode=args.border_mode,
         byte_entropy_threshold=args.byte_entropy_threshold,
         meta_uncertainty_threshold=args.meta_uncertainty_threshold,
-        min_border_fraction=args.min_border_fraction,
+        entropy_floor=args.entropy_floor,
+        entropy_reg_weight=args.entropy_reg_weight,
         dropout=args.dropout,
     )
     model = build_model(args.model_type, model_config).to(device)
@@ -239,6 +245,7 @@ def main() -> None:
                     / math.log(2.0),
                     "train/meta_loss": outputs["meta_loss"].item(),
                     "train/uncertainty_loss": outputs["uncertainty_loss"].item(),
+                    "train/entropy_reg_loss": outputs["entropy_reg_loss"].item(),
                     "train/byte_decoder_loss": outputs["byte_decoder_loss"].item(),
                     "train/byte_decoder_bpb": outputs["byte_decoder_loss"].item()
                     / math.log(2.0),
@@ -255,6 +262,7 @@ def main() -> None:
                     enc=f"{metrics['train/byte_encoder_bpb']:.3f}",
                     meta=f"{metrics['train/meta_loss']:.4f}",
                     unc=f"{metrics['train/uncertainty_loss']:.4f}",
+                    reg=f"{metrics['train/entropy_reg_loss']:.4f}",
                     dec=f"{metrics['train/byte_decoder_loss']:.4f}",
                 )
 
@@ -265,6 +273,7 @@ def main() -> None:
                     f"enc_bpb={metrics['train/byte_encoder_bpb']:.3f} "
                     f"meta={metrics['train/meta_loss']:.4f} "
                     f"unc={metrics['train/uncertainty_loss']:.4f} "
+                    f"reg={metrics['train/entropy_reg_loss']:.4f} "
                     f"dec={metrics['train/byte_decoder_loss']:.4f} "
                     f"borders={format_border_stats(outputs['border_counts'])}"
                 )
@@ -292,6 +301,7 @@ def main() -> None:
                     f"val_enc_bpb={val_metrics['val/byte_encoder_bpb']:.3f} "
                     f"val_meta={val_metrics['val/meta_loss']:.4f} "
                     f"val_unc={val_metrics['val/uncertainty_loss']:.4f} "
+                    f"val_reg={val_metrics['val/entropy_reg_loss']:.4f} "
                     f"val_dec={val_metrics['val/byte_decoder_loss']:.4f}"
                 )
                 if wandb_enabled:

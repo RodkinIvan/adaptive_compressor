@@ -10,11 +10,11 @@ Minimal PyTorch prototype of a hierarchical byte-level language model with adapt
 4. The decoder mirrors the compressor and reconstructs lower-level sequences by broadcast-adding each parent embedding over its child span.
 
 By default, border selection is causal:
-1. Level 0 promotes positions whose byte-prediction entropy is above `--byte-entropy-threshold`.
-2. Higher levels promote positions whose predicted next-embedding uncertainty is above `--meta-uncertainty-threshold`.
+1. Level 0 accumulates byte-prediction entropy within the current span and promotes a border once the cumulative sum exceeds `--byte-entropy-threshold`.
+2. Higher levels accumulate predicted next-embedding uncertainty within the current span and promote a border once the cumulative sum exceeds `--meta-uncertainty-threshold`.
 3. The original teacher-forced border rule is still available with `--border-mode teacher_forced`, but it leaks target information and should not be used for fair LM evaluation.
 4. `--threshold` is kept for the legacy teacher-forced meta-border MSE threshold.
-5. In uncertainty mode, these thresholds are applied to per-sequence normalized scores, not raw entropy/MSE values.
+5. A small entropy regularizer can keep the byte model from becoming too overconfident everywhere without directly changing the routing rule.
 
 ## Baseline
 
@@ -40,8 +40,10 @@ python -m adaptive_compressor.train \
   --hidden-size 128 \
   --num-levels 3 \
   --threshold 0.1 \
-  --byte-entropy-threshold 0.0 \
-  --meta-uncertainty-threshold 0.0 \
+  --byte-entropy-threshold 20.0 \
+  --meta-uncertainty-threshold 1.0 \
+  --entropy-floor 0.0 \
+  --entropy-reg-weight 0.001 \
   --eval-every 20 \
   --max-steps 200
 ```
@@ -93,3 +95,7 @@ python -m adaptive_compressor.infer checkpoints/adaptive_compressor.pt \
 2. `adaptive_compressor/routing.py` - border selection and span routing helpers.
 3. `adaptive_compressor/data.py` - WikiText byte dataset.
 4. `adaptive_compressor/train.py` - small training entry point.
+
+## Visualization
+
+Open `docs/model_visualization.html` for a colleague-facing explanation of the current architecture, the cumulative border rule, and the exact cached inference loop.

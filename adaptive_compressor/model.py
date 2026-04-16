@@ -14,13 +14,11 @@ from .routing import (
     RoutingInfo,
     broadcast_parent_to_child,
     build_routing,
-    ensure_nontrivial_borders,
     gather_parent_tokens,
     make_byte_targets,
     make_meta_targets,
     select_level0_borders,
     select_meta_borders,
-    select_meta_uncertainty_borders,
 )
 
 
@@ -32,9 +30,10 @@ class AdaptiveCompressorConfig:
     num_levels: int = 3
     threshold: float = 0.1
     border_mode: str = "uncertainty"
-    byte_entropy_threshold: float = 0.0
-    meta_uncertainty_threshold: float = 0.0
-    min_border_fraction: float = 0.25
+    byte_entropy_threshold: float = 20.0
+    meta_uncertainty_threshold: float = 1.0
+    entropy_floor: float = 0.0
+    entropy_reg_weight: float = 0.001
     dropout: float = 0.0
     encoder_loss_weight: float = 1.0
     decoder_loss_weight: float = 1.0
@@ -84,14 +83,15 @@ class GRUBlock(nn.Module):
         return outputs
 
 
-def normalize_sequence_scores(
+def cumulative_border_mask(
     scores: torch.Tensor,
+    threshold: float,
     lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Normalize scores per sequence to make thresholding scale-robust."""
+    """Emit a border when cumulative span uncertainty crosses a threshold."""
 
     batch_size, seq_len = scores.shape
-    normalized = scores.new_zeros(scores.shape)
+    border_mask = torch.zeros_like(scores, dtype=torch.bool)
 
     if lengths is None:
         lengths = torch.full(
@@ -100,14 +100,25 @@ def normalize_sequence_scores(
 
     for batch_idx in range(batch_size):
         length = int(lengths[batch_idx].item())
-        if length <= 1:
+        if length <= 0:
             continue
-        valid_scores = scores[batch_idx, 1:length]
-        mean = valid_scores.mean()
-        std = valid_scores.std(unbiased=False).clamp_min(1e-6)
-        normalized[batch_idx, 1:length] = (valid_scores - mean) / std
+        border_mask[batch_idx, 0] = True
+        running_score = scores.new_zeros(())
+        for position in range(1, length):
+            running_score = running_score + scores[batch_idx, position]
+            if running_score >= threshold:
+                border_mask[batch_idx, position] = True
+                running_score = scores.new_zeros(())
 
-    return normalized
+    return border_mask
+
+
+def entropy_regularizer(entropy: torch.Tensor, floor: float) -> torch.Tensor:
+    """Penalize entropy values that fall below a small floor."""
+
+    if floor <= 0:
+        return entropy.new_zeros(())
+    return (floor - entropy).clamp_min(0.0).pow(2).mean()
 
 
 class DecoderBlock(nn.Module):
@@ -214,6 +225,7 @@ class SimpleByteGRUBaseline(nn.Module):
             "byte_decoder_loss": byte_loss,
             "meta_loss": byte_loss.new_zeros(()),
             "uncertainty_loss": byte_loss.new_zeros(()),
+            "entropy_reg_loss": byte_loss.new_zeros(()),
             "byte_encoder_logits": byte_logits,
             "byte_decoder_logits": byte_logits,
             "border_counts": [],
@@ -283,6 +295,7 @@ class AdaptiveCompressor(nn.Module):
         border_counts: list[int] = []
         meta_losses: list[torch.Tensor] = []
         uncertainty_losses: list[torch.Tensor] = []
+        entropy_regularizers: list[torch.Tensor] = []
 
         level0_inputs = self.byte_embedding(byte_ids)
         level_inputs.append(level0_inputs)
@@ -303,21 +316,22 @@ class AdaptiveCompressor(nn.Module):
             byte_encoder_logits.reshape(-1, self.config.vocab_size),
             byte_targets.reshape(-1),
         )
+        byte_probabilities = byte_encoder_logits.softmax(dim=-1)
+        byte_entropy = -(
+            byte_probabilities * byte_probabilities.clamp_min(1e-8).log()
+        ).sum(dim=-1)
+        entropy_regularizers.append(
+            entropy_regularizer(byte_entropy, floor=self.config.entropy_floor)
+        )
 
         if self.config.num_levels > 1:
             if self.config.border_mode == "teacher_forced":
                 border_mask = select_level0_borders(byte_encoder_logits, byte_targets)
             else:
-                probabilities = byte_encoder_logits.softmax(dim=-1)
-                entropy_scores = -(
-                    probabilities * probabilities.clamp_min(1e-8).log()
-                ).sum(dim=-1)
-                normalized_entropy = normalize_sequence_scores(entropy_scores)
-                border_mask = normalized_entropy.gt(self.config.byte_entropy_threshold)
-                border_mask = ensure_nontrivial_borders(
-                    border_mask,
-                    normalized_entropy,
-                    min_border_fraction=self.config.min_border_fraction,
+                border_mask = cumulative_border_mask(
+                    byte_entropy,
+                    threshold=self.config.byte_entropy_threshold,
+                    lengths=level_lengths[0],
                 )
             routing = build_routing(border_mask)
             routings.append(routing)
@@ -363,21 +377,13 @@ class AdaptiveCompressor(nn.Module):
                         threshold=self.config.threshold,
                     )
                 else:
-                    normalized_uncertainty = normalize_sequence_scores(
-                        predicted_uncertainty.squeeze(-1),
-                        lengths=current_lengths,
-                    )
-                    border_mask = select_meta_uncertainty_borders(
-                        normalized_uncertainty.unsqueeze(-1),
-                        valid_mask,
+                    raw_uncertainty = predicted_uncertainty.squeeze(-1)
+                    border_mask = cumulative_border_mask(
+                        raw_uncertainty,
                         threshold=thresholds[level_idx - 1],
-                    )
-                    border_mask = ensure_nontrivial_borders(
-                        border_mask,
-                        normalized_uncertainty,
                         lengths=current_lengths,
-                        min_border_fraction=self.config.min_border_fraction,
                     )
+                    border_mask = border_mask & valid_mask
                 routing = build_routing(border_mask, lengths=current_lengths)
                 routings.append(routing)
                 compressed_inputs = gather_parent_tokens(hidden_states, routing)
@@ -411,11 +417,17 @@ class AdaptiveCompressor(nn.Module):
             if uncertainty_losses
             else byte_decoder_loss.new_zeros(())
         )
+        total_entropy_reg = (
+            torch.stack(entropy_regularizers).mean()
+            if entropy_regularizers
+            else byte_decoder_loss.new_zeros(())
+        )
         total_loss = (
             self.config.encoder_loss_weight * byte_encoder_loss
             + self.config.decoder_loss_weight * byte_decoder_loss
             + self.config.meta_loss_weight * total_meta_loss
             + self.config.uncertainty_loss_weight * total_uncertainty_loss
+            + self.config.entropy_reg_weight * total_entropy_reg
         )
 
         return {
@@ -424,6 +436,7 @@ class AdaptiveCompressor(nn.Module):
             "byte_decoder_loss": byte_decoder_loss,
             "meta_loss": total_meta_loss,
             "uncertainty_loss": total_uncertainty_loss,
+            "entropy_reg_loss": total_entropy_reg,
             "byte_encoder_logits": byte_encoder_logits,
             "byte_decoder_logits": byte_decoder_logits,
             "border_counts": border_counts,
